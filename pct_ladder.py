@@ -581,14 +581,26 @@ def _apply_coin_growth_split(state, name, amount, trader, filters, cfg):
     own coin_reserve via replenish_coin_reserve -- permanently growing it
     over time, not just restoring it to its seeded size) and a buy-side
     portion (queued into pending_reinvest_by_band). `cfg.coin_growth_pct`
-    (0 = all buy-side; 1 = all coin-growth) controls the split. If the
-    coin-growth buy fails or is too thin to clear min_notional, its share
-    falls back to the buy-side portion instead of being discarded -- same
-    never-lose-capital pattern used everywhere else in this project."""
+    (0 = all buy-side; 1 = all coin-growth) controls the split.
+
+    A single sale's coin-growth slice is usually far too small to clear
+    min_notional on its own -- found live 2026-10-13 on XRP (same pct_ladder
+    design): 48 of 52 attempts since this feature went live had been
+    silently skipped, with the slice falling back to buy-side every single
+    time instead of ever becoming coin. Rather than discarding that
+    opportunity each time, the slice now ACCUMULATES in
+    state.pending_coin_growth[name] across sales until the running total
+    is big enough to actually clear min_notional, then resets to zero. Only
+    the non-coin-growth portion (band_amount) still goes to buy-side reinvest
+    every cycle, same as always -- never discarding capital either way."""
     coin_growth_amount = amount * cfg.coin_growth_pct
     band_amount = amount - coin_growth_amount
-    if coin_growth_amount > 0 and not replenish_coin_reserve(state, name, coin_growth_amount, trader, filters, cfg):
-        band_amount += coin_growth_amount
+    if coin_growth_amount > 0:
+        pending = state.pending_coin_growth.get(name, 0.0) + coin_growth_amount
+        if replenish_coin_reserve(state, name, pending, trader, filters, cfg):
+            state.pending_coin_growth[name] = 0.0
+        else:
+            state.pending_coin_growth[name] = pending
     band_key = _band_key(next(o for _, o, _, n in ladder_specs(cfg) if n == name))
     state.pending_reinvest_by_band[band_key] = state.pending_reinvest_by_band.get(band_key, 0.0) + band_amount
 

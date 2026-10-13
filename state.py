@@ -36,6 +36,11 @@ class BotState:
     # COIN units, not USD.
     coin_reserve_qty: dict = field(default_factory=dict)         # name -> ZEC units held, unlisted
     coin_reserve_cost_basis: dict = field(default_factory=dict)  # name -> $ paid per unit at (re)seed time
+    # _apply_coin_growth_split: a single sale's coin-growth slice is usually
+    # far too small to clear min_notional on its own -- accumulates here
+    # per ladder across sales instead of being discarded back to buy-side
+    # every time, until the running total is big enough to actually buy.
+    pending_coin_growth: dict = field(default_factory=dict)      # name -> USD accumulated, not yet converted to coin
 
     def to_dict(self):
         return {
@@ -59,6 +64,7 @@ class BotState:
             "pending_reinvest_by_band": self.pending_reinvest_by_band,
             "coin_reserve_qty": self.coin_reserve_qty,
             "coin_reserve_cost_basis": self.coin_reserve_cost_basis,
+            "pending_coin_growth": self.pending_coin_growth,
         }
 
     @staticmethod
@@ -86,6 +92,7 @@ class BotState:
             pending_reinvest_by_band=d.get("pending_reinvest_by_band", {}),
             coin_reserve_qty=d.get("coin_reserve_qty", {}),
             coin_reserve_cost_basis=d.get("coin_reserve_cost_basis", {}),
+            pending_coin_growth=d.get("pending_coin_growth", {}),
         )
 
 

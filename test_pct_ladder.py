@@ -723,21 +723,56 @@ class TestApplyCoinGrowthSplit:
         # weighted average cost basis must sit between 1.00 and ~2.004, not just reset to ~2.004
         assert 1.00 < state.coin_reserve_cost_basis["ladder2"] < 2.01
 
-    def test_failed_growth_buy_falls_back_entirely_to_buy_side(self):
+    def test_failed_growth_buy_accumulates_in_pending_coin_growth_not_buy_side(self):
+        # Changed 2026-10-13: a failed coin-growth buy used to fall back to
+        # buy-side reinvest IMMEDIATELY and in full -- which meant a ladder
+        # whose coin-growth slice never clears min_notional never grew its
+        # coin reserve at all, ever, no matter how many sales accumulated.
+        # Now it waits in state.pending_coin_growth, retried (bigger) next sale.
         cfg = make_cfg(coin_growth_pct=1.0)
         state = BotState()
         trader, filters = FakeTrader(price=1.40, fail_buy=True), FakeFilters(min_notional=1.0)
         pl._apply_coin_growth_split(state, "ladder2", 10.0, trader, filters, cfg)
         assert state.coin_reserve_qty.get("ladder2", 0.0) == 0.0
-        assert state.pending_reinvest_by_band[pl._band_key(0.02)] == pytest.approx(10.0)  # nothing lost
+        assert state.pending_coin_growth["ladder2"] == pytest.approx(10.0)  # waiting, not lost
+        assert state.pending_reinvest_by_band.get(pl._band_key(0.02), 0.0) == pytest.approx(0.0)
 
-    def test_too_thin_growth_amount_falls_back_to_buy_side(self):
+    def test_too_thin_growth_amount_accumulates_in_pending_coin_growth(self):
         cfg = make_cfg(coin_growth_pct=1.0)
         state = BotState()
         trader, filters = FakeTrader(price=1.40), FakeFilters(min_notional=1000.0)
         pl._apply_coin_growth_split(state, "ladder2", 10.0, trader, filters, cfg)
         assert state.coin_reserve_qty.get("ladder2", 0.0) == 0.0
-        assert state.pending_reinvest_by_band[pl._band_key(0.02)] == pytest.approx(10.0)
+        assert state.pending_coin_growth["ladder2"] == pytest.approx(10.0)  # waiting, not lost
+        assert state.pending_reinvest_by_band.get(pl._band_key(0.02), 0.0) == pytest.approx(0.0)
+
+    def test_accumulates_across_too_thin_calls_until_it_clears_min_notional(self):
+        cfg = make_cfg(coin_growth_pct=1.0)
+        state = BotState()
+        trader, filters = FakeTrader(price=1.40), FakeFilters(min_notional=1.0)
+        pl._apply_coin_growth_split(state, "ladder2", 0.60, trader, filters, cfg)
+        assert state.coin_reserve_qty.get("ladder2", 0.0) == 0.0  # still too thin alone
+        assert state.pending_coin_growth["ladder2"] == pytest.approx(0.60)
+        pl._apply_coin_growth_split(state, "ladder2", 0.60, trader, filters, cfg)
+        assert state.coin_reserve_qty["ladder2"] > 0  # combined $1.20 cleared min_notional
+        assert state.pending_coin_growth["ladder2"] == pytest.approx(0.0)  # reset after the buy
+
+    def test_pending_coin_growth_tracked_independently_per_ladder(self):
+        cfg = make_cfg(coin_growth_pct=1.0)
+        state = BotState()
+        trader, filters = FakeTrader(price=1.40), FakeFilters(min_notional=1.0)
+        pl._apply_coin_growth_split(state, "ladder1", 0.30, trader, filters, cfg)
+        pl._apply_coin_growth_split(state, "ladder2", 0.70, trader, filters, cfg)
+        assert state.pending_coin_growth["ladder1"] == pytest.approx(0.30)
+        assert state.pending_coin_growth["ladder2"] == pytest.approx(0.70)
+
+    def test_buy_side_portion_still_flows_every_cycle_regardless_of_accumulation(self):
+        cfg = make_cfg(coin_growth_pct=0.20)
+        state = BotState()
+        trader, filters = FakeTrader(price=1.40), FakeFilters(min_notional=1000.0)
+        pl._apply_coin_growth_split(state, "ladder2", 10.0, trader, filters, cfg)
+        assert state.pending_reinvest_by_band[pl._band_key(0.02)] == pytest.approx(8.0)
+        assert state.pending_coin_growth["ladder2"] == pytest.approx(2.0)
 
 
 class TestReinvestBothDirectionsIntegration:

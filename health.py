@@ -36,6 +36,7 @@ def write_heartbeat(path: str, current_price: float, state, last_error: str | No
         "ladder_reserved_drawn": state.ladder_reserved_drawn,
         "coin_reserve_qty": state.coin_reserve_qty,
         "coin_reserve_cost_basis": state.coin_reserve_cost_basis,
+        "pending_coin_growth": state.pending_coin_growth,
         "levels": level_summary,
         "last_error": last_error,
         "zone_config": zone_config or {},
