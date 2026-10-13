@@ -1,0 +1,24 @@
+[Unit]
+Description=zec-grid-bot (ZEC/USDT grid trading bot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zecbot
+Group=zecbot
+WorkingDirectory=/opt/zec-grid-bot
+EnvironmentFile=/opt/zec-grid-bot/.env
+ExecStart=/opt/zec-grid-bot/.venv/bin/python /opt/zec-grid-bot/bot.py
+Restart=on-failure
+RestartSec=15
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/zec-grid-bot
+
+[Install]
+WantedBy=multi-user.target
