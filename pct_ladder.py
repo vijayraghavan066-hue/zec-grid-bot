@@ -458,6 +458,62 @@ def reshape_ladder(state, name, lo, hi, step_pct, offset_pct, trader, filters, c
     return 0
 
 
+EXTEND_BATCH_SIZE = 10  # how many new points below current coverage to consider per cycle --
+# bounded so DCA weighting (which favors cheaper points) can't skip the nearest gap to fund a
+# far-cheaper one instead; same reasoning every other point list in this module already relies
+# on being geometrically local. Explicit example figure from the 2026-10-15 request.
+
+
+def extend_ladder_coverage(state, name, step_pct, offset_pct, cfg, filters):
+    """As a ladder's own reserve grows, proactively extends real buy-side
+    coverage DOWNWARD past whatever its lowest rung has ever reached,
+    toward cfg.anchor_low -- independent of the current sliding window,
+    and never touching or rebuilding any existing rung (2026-10-15,
+    explicit request: every rung from a ladder's lowest point up to
+    current price should eventually carry a real order, funded only by
+    that ladder's own reserve as it accrues, never by moving capital out
+    of rungs that already exist). Works in bounded batches of up to
+    EXTEND_BATCH_SIZE points, starting right where the last batch left
+    off, so later cycles keep inching the floor down as reserve regrows."""
+    existing = [lvl for lvl in state.levels
+                if not lvl.one_shot and lvl.state in ("idle", "buy_open", "sell_open")
+                and abs((lvl.sell_price / lvl.buy_price - 1.0) - offset_pct) < OFFSET_TOLERANCE_PCT]
+    if not existing:
+        return 0  # nothing built yet for this ladder -- reshape_ladder's own bootstrap handles that first
+    lowest = min(lvl.buy_price for lvl in existing)
+    if lowest <= cfg.anchor_low:
+        return 0  # already reached the floor
+
+    new_points = []
+    p = lowest / (1.0 + step_pct)
+    while p >= cfg.anchor_low and len(new_points) < EXTEND_BATCH_SIZE:
+        new_points.append(round(p, 10))
+        p = p / (1.0 + step_pct)
+    if not new_points:
+        return 0
+
+    reserve_draw = _draw_from_ladder_reserve(state, cfg, name)
+    if reserve_draw <= 0:
+        return 0
+
+    thinned = _thin_to_affordable(new_points, reserve_draw, cfg.reference_price, cfg.dca_exponent, filters.min_notional)
+    fresh = _dca_build_levels(thinned, reserve_draw, cfg.reference_price, cfg.dca_exponent,
+                               offset_pct, filters, state.next_level_index)
+    if not fresh:
+        # Too thin to build anything real this cycle -- return the draw
+        # untouched rather than losing it (same undo pattern reshape_ladder
+        # uses for its own no-op branch).
+        state.ladder_reserved[name] = state.ladder_reserved.get(name, 0.0) + reserve_draw
+        state.ladder_reserved_drawn[name] = max(0.0, state.ladder_reserved_drawn.get(name, 0.0) - reserve_draw)
+        return 0
+
+    state.next_level_index += len(fresh)
+    state.levels.extend(fresh)
+    log.info(f"pct_ladder: {name} extended coverage downward with {len(fresh)} new rung(s) "
+             f"(${reserve_draw:.4f} from reserve), lowest now ${min(l.buy_price for l in fresh):.6f}")
+    return len(fresh)
+
+
 def maybe_reshape_ladders(state, current_price, trader, filters, cfg):
     """Runs every poll cycle. Deliberately NOT gated on price having moved
     -- a ladder can get stuck while price just sits still (capital eroded
@@ -472,6 +528,7 @@ def maybe_reshape_ladders(state, current_price, trader, filters, cfg):
         if hi <= lo:
             continue
         total_reshaped += reshape_ladder(state, name, lo, hi, step_pct, offset_pct, trader, filters, cfg, current_price)
+        total_reshaped += extend_ladder_coverage(state, name, step_pct, offset_pct, cfg, filters)
     return total_reshaped
 
 
@@ -483,25 +540,32 @@ def maybe_fund_sell_from_reserve(state, current_price, trader, filters, cfg):
     owning the coin. seed_coin_reserve.py (one-time) and
     replenish_coin_reserve (below, ongoing) keep state.coin_reserve_qty
     stocked with a standing, unlisted amount of coin per ladder precisely
-    for this: if a ladder currently has ZERO live sell_open positions of
-    its own (gap matches its offset_pct exactly) but still holds reserve
-    coin, list it as a real sell order right now -- the ladder is never
-    left with nothing to offer just because price hasn't dipped into its
-    window yet. Cheap no-op in the common case (any ladder with a live
-    sell already, or an empty reserve)."""
+    for this.
+
+    Two cases, same underlying mechanic:
+    - Zero live sells of its own: lists the reserve at its natural price
+      (cost_basis * (1 + offset_pct)) so the ladder is never left with
+      nothing to offer just because price hasn't dipped into its window yet.
+    - Already has live sells: (2026-10-15, explicit request) still lists the
+      reserve as soon as there's enough of it to clear min_notional, priced
+      just above whatever currently sits highest -- extending real sell
+      coverage upward over time as the reserve regrows (mirrors
+      extend_ladder_coverage's downward growth on the buy side), instead of
+      sitting on it until the ladder goes completely dry. Either way, never
+      touches or rebuilds an existing sell order.
+
+    Cheap no-op in the common case (empty reserve)."""
     from grid import GridLevel
 
     listed = 0
-    for _, offset_pct, _, name in ladder_specs(cfg):
+    for step_pct, offset_pct, _, name in ladder_specs(cfg):
         qty = state.coin_reserve_qty.get(name, 0.0)
         if qty <= 0:
             continue
 
-        own_sells = sum(1 for lvl in state.levels
-                         if lvl.state == "sell_open" and lvl.buy_price > 0
-                         and abs((lvl.sell_price / lvl.buy_price - 1.0) - offset_pct) < OFFSET_TOLERANCE_PCT)
-        if own_sells > 0:
-            continue
+        own_sells = [lvl for lvl in state.levels
+                     if lvl.state == "sell_open" and lvl.buy_price > 0
+                     and abs((lvl.sell_price / lvl.buy_price - 1.0) - offset_pct) < OFFSET_TOLERANCE_PCT]
 
         cost_basis = state.coin_reserve_cost_basis.get(name, 0.0)
         round_qty = filters.round_qty(qty)
@@ -513,6 +577,9 @@ def maybe_fund_sell_from_reserve(state, current_price, trader, filters, cfg):
         # seconds stale by the time we get here.
         fresh_price = trader.get_price()
         natural_price = cost_basis * (1.0 + offset_pct)
+        if own_sells:
+            highest_sell = max(lvl.sell_price for lvl in own_sells)
+            natural_price = max(natural_price, highest_sell * (1.0 + step_pct))
         sell_price = filters.round_price(max(natural_price, fresh_price + cfg.taker_avoidance_buffer))
         if round_qty * sell_price < filters.min_notional:
             log.warning(f"pct_ladder: {name} coin reserve ({round_qty} @ ~${sell_price:.6f}) too thin "
@@ -533,8 +600,12 @@ def maybe_fund_sell_from_reserve(state, current_price, trader, filters, cfg):
         state.levels.append(new_lvl)
         state.coin_reserve_qty[name] = 0.0
         listed += 1
-        log.info(f"pct_ladder: {name} had zero live sells of its own -- listed its coin reserve "
-                 f"({round_qty} @ ${sell_price:.6f}, cost basis ${cost_basis:.6f}) as a real sell order")
+        if own_sells:
+            log.info(f"pct_ladder: {name} extended sell coverage upward with its coin reserve "
+                     f"({round_qty} @ ${sell_price:.6f}), above previous highest ${highest_sell:.6f}")
+        else:
+            log.info(f"pct_ladder: {name} had zero live sells of its own -- listed its coin reserve "
+                     f"({round_qty} @ ${sell_price:.6f}, cost basis ${cost_basis:.6f}) as a real sell order")
     return listed
 
 
