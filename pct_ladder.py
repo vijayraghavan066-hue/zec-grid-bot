@@ -101,51 +101,38 @@ def liquidate_legacy_position(state, profit: float, principal: float, cfg, trade
 
     PRINCIPAL (what was originally spent to acquire the position) merges
     evenly into the 5 ladders' pending_reinvest_by_band, same as always --
-    it's returned capital, not profit, so it's not eligible for the
-    coin-growth split below (only profit-derived amounts are).
+    it's returned capital, not profit, so it's not subject to the 4-way
+    profit split below (only profit-derived amounts are).
 
-    PROFIT splits reserve/reinvest same as any ladder-native sale, evenly
-    across the 5 ladders; each ladder's own reinvest share then reinvests
-    in BOTH directions via _apply_coin_growth_split (coin-reserve growth +
-    buy-side pending-reinvest), same as distribute_profit_ladder_aware.
+    PROFIT splits evenly across the 5 ladders, then each ladder's share
+    goes through _split_profit_four_ways (accumulation, compounding,
+    ladder reserve, coin reserve), same as distribute_profit_ladder_aware.
 
-    Principal is NOT subject to profit_reserve_ratio -- reserving part of
-    your own principal as a 'safety net' doesn't make sense; only genuine
-    profit gets reserved."""
+    Principal is NOT subject to the profit split -- reserving part of your
+    own principal as a 'safety net' doesn't make sense; only genuine
+    profit is split."""
     profit = max(0.0, profit)
-    reserve_amount = profit * cfg.profit_reserve_ratio
-    distribute_amount = profit - reserve_amount
-
     state.total_profit_realized += profit
 
     specs = ladder_specs(cfg)
-    if reserve_amount > 0:
-        reserve_share = reserve_amount / len(specs)
-        for _, _, _, name in specs:
-            state.ladder_reserved[name] = state.ladder_reserved.get(name, 0.0) + reserve_share
-            state.ladder_reserved_contributed[name] = state.ladder_reserved_contributed.get(name, 0.0) + reserve_share
-
     principal_share = principal / len(specs)
-    distribute_share = distribute_amount / len(specs)
+    profit_share = profit / len(specs)
     for _, ladder_offset_pct, _, name in specs:
         band_key = _band_key(ladder_offset_pct)
         state.pending_reinvest_by_band[band_key] = state.pending_reinvest_by_band.get(band_key, 0.0) + principal_share
-        _apply_coin_growth_split(state, name, distribute_share, trader, filters, cfg)
+        _split_profit_four_ways(state, name, profit_share, trader, filters, cfg)
 
     log.info(f"pct_ladder: legacy position liquidated -- principal ${principal:.4f} split evenly "
              f"into buy-side reinvest across all {len(specs)} ladders, profit ${profit:.4f} "
-             f"({reserve_amount:.4f} reserved, {distribute_amount:.4f} split between buy-side "
-             f"reinvest and coin-reserve growth)")
+             f"split evenly then 4 ways per ladder (see per-ladder log lines above)")
 
 
 def distribute_profit_ladder_aware(state, profit: float, sold_offset_pct: float, cfg, trader, filters) -> str:
     """Replaces reinvest.py's distribute_profit for the new ladder system:
-    reserve_ratio of profit goes into reserve. The remainder (the reinvest
-    share) now reinvests in BOTH directions, via _apply_coin_growth_split:
-    cfg.coin_growth_pct of it buys more coin into that ladder's own
-    coin_reserve (permanently growing it over time), the rest queues into
-    pending_reinvest_by_band, picked up by reshape_ladder's future_pool on
-    its next cycle.
+    every sale's profit is split 4 ways via _split_profit_four_ways --
+    bot-wide accumulation (never drawn), buy-side compounding, this
+    ladder's own USD reserve (still auto-drawable), and this ladder's own
+    coin reserve.
 
     A position whose gap EXACTLY matches one of the 5 ladders (a real rung
     of that ladder) has its ENTIRE profit routed to that one ladder.
@@ -166,25 +153,15 @@ def distribute_profit_ladder_aware(state, profit: float, sold_offset_pct: float,
     exact_name = _exact_ladder_match(sold_offset_pct, cfg)
 
     if exact_name is not None:
-        reserve_amount = profit * cfg.profit_reserve_ratio
-        distribute_amount = profit - reserve_amount
-        state.ladder_reserved[exact_name] = state.ladder_reserved.get(exact_name, 0.0) + reserve_amount
-        state.ladder_reserved_contributed[exact_name] = state.ladder_reserved_contributed.get(exact_name, 0.0) + reserve_amount
-        _apply_coin_growth_split(state, exact_name, distribute_amount, trader, filters, cfg)
-        log.info(f"pct_ladder: profit {profit:.4f} attributed to {exact_name} (exact offset match) -- "
-                 f"{reserve_amount:.4f} to its own reserve (now ${state.ladder_reserved[exact_name]:.4f}), "
-                 f"{distribute_amount:.4f} split between buy-side reinvest and coin-reserve growth")
+        _split_profit_four_ways(state, exact_name, profit, trader, filters, cfg)
         return exact_name
 
     share = profit / len(specs)
     for _, ladder_offset_pct, _, name in specs:
-        reserve_amount = share * cfg.profit_reserve_ratio
-        distribute_amount = share - reserve_amount
-        state.ladder_reserved[name] = state.ladder_reserved.get(name, 0.0) + reserve_amount
-        state.ladder_reserved_contributed[name] = state.ladder_reserved_contributed.get(name, 0.0) + reserve_amount
-        _apply_coin_growth_split(state, name, distribute_amount, trader, filters, cfg)
+        _split_profit_four_ways(state, name, share, trader, filters, cfg)
     log.info(f"pct_ladder: profit {profit:.4f} from a legacy position (offset {sold_offset_pct:.4f}, "
-             f"no exact ladder match) -- split evenly across all 5 ladders (${share:.4f} each before reserve split)")
+             f"no exact ladder match) -- split evenly across all 5 ladders (${share:.4f} each, "
+             f"see per-ladder log lines above)")
     return "legacy-even-split"
 
 
@@ -618,10 +595,10 @@ def replenish_coin_reserve(state, name, amount, trader, filters, cfg):
     - liquidate_coin_reserve_position: `amount` = a just-sold reserve
       position's own principal, closing the loop back to its original
       seeded size (replenishment).
-    - _apply_coin_growth_split: `amount` = a slice of ordinary profit
-      reinvestment (coin_growth_pct), permanently GROWING the reserve
-      beyond its original seed size over time, gradually, across every
-      ladder-native/legacy/reserve sale -- not just restoring it.
+    - _grow_coin_reserve: `amount` = a slice of ordinary profit
+      reinvestment (cfg.coin_reserve_ratio), permanently GROWING the
+      reserve beyond its original seed size over time, gradually, across
+      every ladder-native/legacy/reserve sale -- not just restoring it.
     Either way this never touches the ladder's buying power or its own
     USD reserve pool.
 
@@ -651,7 +628,7 @@ def replenish_coin_reserve(state, name, amount, trader, filters, cfg):
     old_qty = state.coin_reserve_qty.get(name, 0.0)
     old_cost_basis = state.coin_reserve_cost_basis.get(name, 0.0)
     new_qty = old_qty + qty
-    # Weighted average, not a plain overwrite -- matters once coin_growth_pct
+    # Weighted average, not a plain overwrite -- matters once coin-reserve growth
     # can call this repeatedly while the reserve is ALREADY nonzero (gradual
     # growth from many small profit events), not just the old draw-then-
     # replenish case where it always started at exactly zero.
@@ -664,34 +641,61 @@ def replenish_coin_reserve(state, name, amount, trader, filters, cfg):
     return True
 
 
-def _apply_coin_growth_split(state, name, amount, trader, filters, cfg):
-    """Reinvest in both directions: splits a per-ladder profit-reinvest
-    share into a coin-growth portion (buys more coin into that ladder's
-    own coin_reserve via replenish_coin_reserve -- permanently growing it
-    over time, not just restoring it to its seeded size) and a buy-side
-    portion (queued into pending_reinvest_by_band). `cfg.coin_growth_pct`
-    (0 = all buy-side; 1 = all coin-growth) controls the split.
+def _grow_coin_reserve(state, name, coin_amount, trader, filters, cfg):
+    """Buys coin with this ladder's already-sized coin-reserve slice of a
+    sale's profit (cfg.coin_reserve_ratio of it -- sizing now happens
+    once, in _split_profit_four_ways, not here).
 
-    A single sale's coin-growth slice is usually far too small to clear
-    min_notional on its own -- found live 2026-10-13 on XRP (same pct_ladder
-    design): 48 of 52 attempts since this feature went live had been
-    silently skipped, with the slice falling back to buy-side every single
-    time instead of ever becoming coin. Rather than discarding that
-    opportunity each time, the slice now ACCUMULATES in
-    state.pending_coin_growth[name] across sales until the running total
-    is big enough to actually clear min_notional, then resets to zero. Only
-    the non-coin-growth portion (band_amount) still goes to buy-side reinvest
-    every cycle, same as always -- never discarding capital either way."""
-    coin_growth_amount = amount * cfg.coin_growth_pct
-    band_amount = amount - coin_growth_amount
-    if coin_growth_amount > 0:
-        pending = state.pending_coin_growth.get(name, 0.0) + coin_growth_amount
-        if replenish_coin_reserve(state, name, pending, trader, filters, cfg):
-            state.pending_coin_growth[name] = 0.0
-        else:
-            state.pending_coin_growth[name] = pending
+    A single sale's slice is usually far too small to clear min_notional
+    on its own -- found live 2026-10-13 on XRP (same pct_ladder design):
+    48 of 52 attempts since this feature went live had been silently
+    skipped. Rather than discarding that opportunity each time, the slice
+    ACCUMULATES in state.pending_coin_growth[name] across sales until the
+    running total is big enough to actually clear min_notional, then
+    resets to zero."""
+    if coin_amount <= 0:
+        return
+    pending = state.pending_coin_growth.get(name, 0.0) + coin_amount
+    if replenish_coin_reserve(state, name, pending, trader, filters, cfg):
+        state.pending_coin_growth[name] = 0.0
+    else:
+        state.pending_coin_growth[name] = pending
+
+
+def _split_profit_four_ways(state, name, profit, trader, filters, cfg):
+    """Splits a ladder-attributed profit amount 4 ways (ratios configurable,
+    must sum to 1.0 -- see config.py's validate()):
+    - cfg.accum_ratio -> state.reserved_total, bot-wide, never auto-drawn
+      by anything.
+    - cfg.compound_ratio -> this ladder's pending_reinvest_by_band (today's
+      existing buy-side compounding, picked up by reshape_ladder).
+    - cfg.ladder_reserve_ratio -> this ladder's own state.ladder_reserved --
+      still auto-drawable via _draw_from_ladder_reserve, unchanged from
+      today's behavior.
+    - cfg.coin_reserve_ratio -> this ladder's own coin reserve, via
+      _grow_coin_reserve."""
+    if profit <= 0:
+        return
+    accum_amount = profit * cfg.accum_ratio
+    compound_amount = profit * cfg.compound_ratio
+    reserve_amount = profit * cfg.ladder_reserve_ratio
+    coin_amount = profit * cfg.coin_reserve_ratio
+
+    state.reserved_total += accum_amount
+
     band_key = _band_key(next(o for _, o, _, n in ladder_specs(cfg) if n == name))
-    state.pending_reinvest_by_band[band_key] = state.pending_reinvest_by_band.get(band_key, 0.0) + band_amount
+    state.pending_reinvest_by_band[band_key] = state.pending_reinvest_by_band.get(band_key, 0.0) + compound_amount
+
+    state.ladder_reserved[name] = state.ladder_reserved.get(name, 0.0) + reserve_amount
+    state.ladder_reserved_contributed[name] = state.ladder_reserved_contributed.get(name, 0.0) + reserve_amount
+
+    _grow_coin_reserve(state, name, coin_amount, trader, filters, cfg)
+
+    log.info(f"pct_ladder: {name} profit {profit:.4f} split 4 ways -- "
+             f"${accum_amount:.4f} accumulation (never drawn, bot total now ${state.reserved_total:.4f}), "
+             f"${compound_amount:.4f} buy-side compounding, "
+             f"${reserve_amount:.4f} to its own reserve (now ${state.ladder_reserved[name]:.4f}), "
+             f"${coin_amount:.4f} toward coin reserve")
 
 
 def liquidate_coin_reserve_position(state, lvl, profit, trader, filters, cfg) -> bool:
@@ -701,27 +705,21 @@ def liquidate_coin_reserve_position(state, lvl, profit, trader, filters, cfg) ->
     sell/buy gap, since the taker-avoidance floor in
     maybe_fund_sell_from_reserve can make that gap land slightly wider than
     the ladder's exact offset_pct (which would otherwise misroute via
-    distribute_profit_ladder_aware's own offset matching). Reserve share of
-    profit goes to that ladder's own reserve, same as any normal sale. The
-    caller is responsible for removing the level from state.levels -- this
-    function only handles capital.
+    distribute_profit_ladder_aware's own offset matching). The caller is
+    responsible for removing the level from state.levels -- this function
+    only handles capital.
 
-    Its own PROFIT reinvest share (separate from the principal
-    replenishment above) also reinvests in both directions via
-    _apply_coin_growth_split, same as any other sale -- so a reserve
-    position's profit can grow the reserve FURTHER, on top of the
-    principal already restoring it to its seeded size.
+    The sale's PRINCIPAL (separate from its profit) replenishes the coin
+    reserve back toward its pre-sale size. Its PROFIT goes through the
+    same 4-way split as any other sale (_split_profit_four_ways) -- so a
+    reserve position's profit can grow the coin reserve FURTHER, on top of
+    the principal already restoring it.
 
     Returns True if the coin reserve was successfully replenished from this
     sale's principal."""
     name = lvl.coin_reserve_ladder
     principal = lvl.buy_price * lvl.qty
     profit = max(0.0, profit)
-    reserve_amount = profit * cfg.profit_reserve_ratio
-    distribute_amount = profit - reserve_amount
-
-    state.ladder_reserved[name] = state.ladder_reserved.get(name, 0.0) + reserve_amount
-    state.ladder_reserved_contributed[name] = state.ladder_reserved_contributed.get(name, 0.0) + reserve_amount
     state.total_profit_realized += profit
 
     refilled = replenish_coin_reserve(state, name, principal, trader, filters, cfg)
@@ -729,10 +727,9 @@ def liquidate_coin_reserve_position(state, lvl, profit, trader, filters, cfg) ->
         band_key = _band_key(next(o for _, o, _, n in ladder_specs(cfg) if n == name))
         state.pending_reinvest_by_band[band_key] = state.pending_reinvest_by_band.get(band_key, 0.0) + principal
 
-    _apply_coin_growth_split(state, name, distribute_amount, trader, filters, cfg)
+    _split_profit_four_ways(state, name, profit, trader, filters, cfg)
 
-    log.info(f"pct_ladder: {name} coin-reserve position liquidated -- profit {profit:.4f} "
-             f"({reserve_amount:.4f} reserved, {distribute_amount:.4f} split between buy-side "
-             f"reinvest and further coin-reserve growth), principal ${principal:.4f} "
-             + ("replenished the reserve" if refilled else "queued to pending-reinvest (replenishment failed)"))
+    log.info(f"pct_ladder: {name} coin-reserve position liquidated -- principal ${principal:.4f} "
+             + ("replenished the reserve" if refilled else "queued to pending-reinvest (replenishment failed)")
+             + f", profit ${profit:.4f} split 4 ways (see line above)")
     return refilled

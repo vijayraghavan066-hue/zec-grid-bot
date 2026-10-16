@@ -73,9 +73,15 @@ class Config:
     reserved_draw_floor_pct: float      # each draw capped so a ladder's own reserve never drops below this fraction of itself
     reserved_topup_threshold_usd: float  # a ladder's own (idle+buy_open) capital below this triggers an auto top-up from its reserve
     coin_reserve_pct: float  # fraction of each ladder's buying power carved out ONCE by seed_coin_reserve.py into a standing coin reserve
-    coin_growth_pct: float   # fraction of every profit reinvest share redirected into buying more coin (growing the reserve) instead of buy-side pending-reinvest
+    # Every sale's profit splits 4 ways (must sum to 1.0) -- see pct_ladder.py's
+    # _split_profit_four_ways. accum_ratio is the only one of the four never
+    # auto-drawn by anything; ladder_reserve_ratio keeps today's auto-top-up
+    # behavior (_draw_from_ladder_reserve) unchanged.
+    accum_ratio: float
+    compound_ratio: float
+    ladder_reserve_ratio: float
+    coin_reserve_ratio: float
     dry_run: bool
-    profit_reserve_ratio: float
     reinvest_band_pct: float
     pending_reinvest_max_hours: float
     poll_interval_seconds: int
@@ -154,9 +160,11 @@ def load_config() -> Config:
         reserved_draw_floor_pct=float(_get("RESERVED_DRAW_FLOOR_PCT", "0.5")),
         reserved_topup_threshold_usd=float(_get("RESERVED_TOPUP_THRESHOLD_USD", "5.0")),
         coin_reserve_pct=float(_get("COIN_RESERVE_PCT", "0.10")),
-        coin_growth_pct=float(_get("COIN_GROWTH_PCT", "0.20")),
+        accum_ratio=float(_get("ACCUM_RATIO", "0.25")),
+        compound_ratio=float(_get("COMPOUND_RATIO", "0.25")),
+        ladder_reserve_ratio=float(_get("LADDER_RESERVE_RATIO", "0.25")),
+        coin_reserve_ratio=float(_get("COIN_RESERVE_RATIO", "0.25")),
         dry_run=_get_bool("DRY_RUN", True),
-        profit_reserve_ratio=float(_get("PROFIT_RESERVE_RATIO", "0.5")),
         reinvest_band_pct=float(_get("REINVEST_BAND_PCT", "0.04")),
         pending_reinvest_max_hours=float(_get("PENDING_REINVEST_MAX_HOURS", "24")),
         poll_interval_seconds=int(_get("POLL_INTERVAL_SECONDS", "300")),
@@ -204,8 +212,15 @@ def load_config() -> Config:
         raise RuntimeError("CIRCUIT_BREAKER_WINDOW_HOURS must be positive")
     if not (0.0 < cfg.circuit_breaker_resume_pct < 1.0):
         raise RuntimeError("CIRCUIT_BREAKER_RESUME_PCT must be between 0 and 1 (e.g. 0.05 for 5%)")
-    if not (0.0 <= cfg.profit_reserve_ratio <= 1.0):
-        raise RuntimeError("PROFIT_RESERVE_RATIO must be between 0 and 1")
+    for name in ("accum_ratio", "compound_ratio", "ladder_reserve_ratio", "coin_reserve_ratio"):
+        val = getattr(cfg, name)
+        if not (0.0 <= val <= 1.0):
+            raise RuntimeError(f"{name.upper()} must be between 0 and 1, got {val}")
+    four_way_total = (cfg.accum_ratio + cfg.compound_ratio
+                       + cfg.ladder_reserve_ratio + cfg.coin_reserve_ratio)
+    if abs(four_way_total - 1.0) > 1e-6:
+        raise RuntimeError("ACCUM_RATIO + COMPOUND_RATIO + LADDER_RESERVE_RATIO + "
+                            f"COIN_RESERVE_RATIO must sum to 1.0, got {four_way_total}")
     if not (0.0 < cfg.reinvest_band_pct < 1.0):
         raise RuntimeError("REINVEST_BAND_PCT must be between 0 and 1 (e.g. 0.04 for 4%)")
     if cfg.pending_reinvest_max_hours <= 0:
@@ -228,7 +243,5 @@ def load_config() -> Config:
         raise RuntimeError("RESERVED_TOPUP_THRESHOLD_USD must be zero or positive")
     if not (0.0 <= cfg.coin_reserve_pct < 1.0):
         raise RuntimeError("COIN_RESERVE_PCT must be between 0 and 1 (e.g. 0.10 for 10%)")
-    if not (0.0 <= cfg.coin_growth_pct <= 1.0):
-        raise RuntimeError("COIN_GROWTH_PCT must be between 0 and 1 (e.g. 0.20 for 20%)")
 
     return cfg

@@ -224,7 +224,13 @@ def run():
                             log.info(f"Grid {lvl.index} (${lvl.buy_price}): SELL filled "
                                       f"qty={lvl.qty} profit={profit:.4f} USD"
                                       + (" [one_shot, closing for good]" if lvl.one_shot else ""))
-                            reserved_amount = profit * cfg.profit_reserve_ratio
+                            # Ledger only has 2 split columns (reserved/distributed); the real
+                            # split is 4-way now (see _split_profit_four_ways) -- reserved_usdt
+                            # here is just the ladder-reserve_ratio slice (still auto-drawable,
+                            # same meaning as before), distributed_usdt is everything else
+                            # (accumulation + compounding + coin reserve combined). Full
+                            # per-bucket amounts are in the pct_ladder log line and state.json.
+                            reserved_amount = profit * cfg.ladder_reserve_ratio
                             log_sell_fill(cfg.ledger_file, lvl.index, lvl.buy_price, lvl.sell_price,
                                           lvl.qty, profit, reserved_amount, profit - reserved_amount,
                                           lvl.one_shot, cfg.dry_run)

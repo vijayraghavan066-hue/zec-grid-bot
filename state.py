@@ -9,6 +9,11 @@ from grid import GridLevel
 @dataclass
 class BotState:
     levels: list = field(default_factory=list)  # list[GridLevel]
+    # Bot-wide accumulation (cfg.accum_ratio of every sale's profit, via
+    # _split_profit_four_ways) -- NOT the "shared drawable reserve" the
+    # module docstring warns against. Nothing ever draws this back out; it
+    # is a one-way savings total, separate in purpose from ladder_reserved
+    # below (which stays per-ladder and auto-drawable).
     reserved_total: float = 0.0
     total_profit_realized: float = 0.0
     config_signature: dict = field(default_factory=dict)
@@ -36,7 +41,7 @@ class BotState:
     # COIN units, not USD.
     coin_reserve_qty: dict = field(default_factory=dict)         # name -> ZEC units held, unlisted
     coin_reserve_cost_basis: dict = field(default_factory=dict)  # name -> $ paid per unit at (re)seed time
-    # _apply_coin_growth_split: a single sale's coin-growth slice is usually
+    # _grow_coin_reserve: a single sale's coin-reserve slice is usually
     # far too small to clear min_notional on its own -- accumulates here
     # per ladder across sales instead of being discarded back to buy-side
     # every time, until the running total is big enough to actually buy.
