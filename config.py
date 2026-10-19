@@ -73,6 +73,7 @@ class Config:
     reserved_draw_floor_pct: float      # each draw capped so a ladder's own reserve never drops below this fraction of itself
     reserved_topup_threshold_usd: float  # a ladder's own (idle+buy_open) capital below this triggers an auto top-up from its reserve
     coin_reserve_pct: float  # fraction of each ladder's buying power carved out ONCE by seed_coin_reserve.py into a standing coin reserve
+    extend_min_free_balance_usd: float  # extend_ladder_coverage skips the whole cycle (all 5 ladders) when free quote-asset balance is below this -- throttle so it doesn't race other bots/ladders for the same shared exchange balance
     # Every sale's profit splits 4 ways (must sum to 1.0) -- see pct_ladder.py's
     # _split_profit_four_ways. accum_ratio is the only one of the four never
     # auto-drawn by anything; ladder_reserve_ratio keeps today's auto-top-up
@@ -160,6 +161,7 @@ def load_config() -> Config:
         reserved_draw_floor_pct=float(_get("RESERVED_DRAW_FLOOR_PCT", "0.5")),
         reserved_topup_threshold_usd=float(_get("RESERVED_TOPUP_THRESHOLD_USD", "5.0")),
         coin_reserve_pct=float(_get("COIN_RESERVE_PCT", "0.10")),
+        extend_min_free_balance_usd=float(_get("EXTEND_MIN_FREE_BALANCE_USD", "15.0")),
         accum_ratio=float(_get("ACCUM_RATIO", "0.25")),
         compound_ratio=float(_get("COMPOUND_RATIO", "0.25")),
         ladder_reserve_ratio=float(_get("LADDER_RESERVE_RATIO", "0.25")),
@@ -243,5 +245,7 @@ def load_config() -> Config:
         raise RuntimeError("RESERVED_TOPUP_THRESHOLD_USD must be zero or positive")
     if not (0.0 <= cfg.coin_reserve_pct < 1.0):
         raise RuntimeError("COIN_RESERVE_PCT must be between 0 and 1 (e.g. 0.10 for 10%)")
+    if cfg.extend_min_free_balance_usd < 0:
+        raise RuntimeError("EXTEND_MIN_FREE_BALANCE_USD must be zero or positive")
 
     return cfg

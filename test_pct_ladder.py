@@ -37,13 +37,15 @@ def make_cfg(**overrides):
         # auto-drawable), coin reserve. Equal 25% default, same as live.
         accum_ratio=0.25, compound_ratio=0.25,
         ladder_reserve_ratio=0.25, coin_reserve_ratio=0.25,
+        symbol="ZECUSDT", extend_min_free_balance_usd=15.0,
     )
     base.update(overrides)
     return type("Cfg", (), base)()
 
 
 class FakeTrader:
-    def __init__(self, fail_cancel_ids=None, price=1.40, fail_sell=False, fail_buy=False):
+    def __init__(self, fail_cancel_ids=None, price=1.40, fail_sell=False, fail_buy=False,
+                 free_balance=1_000_000.0):
         self.cancelled = []
         self.fail_cancel_ids = fail_cancel_ids or set()
         self.price = price
@@ -52,6 +54,10 @@ class FakeTrader:
         self.placed_sells = []  # list[(price, qty)]
         self.placed_buys = []   # list[(price, qty)]
         self._next_id = 0
+        self.free_balance = free_balance
+
+    def get_free_balance(self, asset):
+        return self.free_balance
 
     def cancel_order(self, order_id):
         if order_id in self.fail_cancel_ids:
@@ -669,6 +675,39 @@ class TestMaybeReshapeLadders:
         gaps = {round(lvl.sell_price / lvl.buy_price - 1.0, 4) for lvl in state.levels}
         for pct in (0.01, 0.02, 0.03, 0.04, 0.05):
             assert round(pct, 4) in gaps
+
+    def test_extend_throttled_vs_healthy_free_balance(self):
+        # 2026-10-18: extend_ladder_coverage alone used to run regardless of
+        # real exchange balance, racing other ladders/bots for the same
+        # shared pool. A per-cycle balance check must gate it. Compares two
+        # runs from an IDENTICAL starting state rather than asserting an
+        # absolute lowest price -- reshape_ladder's own dry-ladder path can
+        # independently rebuild a ladder from scratch regardless of this
+        # throttle, which would make an absolute assertion flaky. The
+        # relative comparison isolates extend's own contribution: it fires
+        # identically in both runs except for the balance gate.
+        def fresh_state():
+            existing = [GridLevel(index=i, buy_price=p, sell_price=p * 1.01, base_qty=5.0,
+                                   qty=5.0, state="sell_open")
+                        for i, p in enumerate([1.30, 1.313])]
+            return BotState(levels=list(existing),
+                             ladder_reserved={f"ladder{n}": 100.0 for n in range(1, 6)})
+
+        def ladder1_min(state):
+            lows = [lvl.buy_price for lvl in state.levels
+                    if abs((lvl.sell_price / lvl.buy_price - 1.0) - 0.01) < 1e-6]
+            return min(lows)
+
+        cfg = make_cfg(extend_min_free_balance_usd=15.0)
+        filters = FakeFilters(min_notional=1.0)
+
+        thin_state = fresh_state()
+        pl.maybe_reshape_ladders(thin_state, 1.40, FakeTrader(price=1.40, free_balance=3.0), filters, cfg)
+
+        healthy_state = fresh_state()
+        pl.maybe_reshape_ladders(healthy_state, 1.40, FakeTrader(price=1.40, free_balance=1_000_000.0), filters, cfg)
+
+        assert ladder1_min(healthy_state) < ladder1_min(thin_state)
 
 
 class TestMaybeFundSellFromReserve:
