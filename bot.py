@@ -12,7 +12,7 @@ from ladder_ledger import write_ladder_ledgers
 from ledger import log_buy_fill, log_sell_fill
 from pct_ladder import (distribute_profit_ladder_aware, is_legacy_offset, ladder_specs,
                          liquidate_coin_reserve_position, liquidate_legacy_position,
-                         maybe_fund_sell_from_reserve, maybe_reshape_ladders)
+                         maybe_fund_sell_from_reserve, maybe_protect_profit, maybe_reshape_ladders)
 from state import load_state, save_state
 
 log = logging.getLogger("zec-grid-bot")
@@ -121,6 +121,14 @@ def run():
 
     trader = BinanceUSTrader(cfg.api_key, cfg.api_secret, cfg.symbol, cfg.dry_run)
     filters = trader.get_symbol_filters()
+
+    # Separate trader/filters for cfg.protect_symbol (e.g. USDCUSDT) --
+    # deliberately not cfg.symbol's own trader, since the whole point of
+    # protect_profit is converting into something this bot (and every
+    # other bot sharing the same Binance.US account) never otherwise
+    # touches. Same API key, same account, just a different market.
+    protect_trader = BinanceUSTrader(cfg.api_key, cfg.api_secret, cfg.protect_symbol, cfg.dry_run)
+    protect_filters = protect_trader.get_symbol_filters()
 
     current_signature = {
         "symbol": cfg.symbol,
@@ -286,6 +294,9 @@ def run():
 
                 apply_order_window(state, current_price, trader, filters, cfg.max_open_orders,
                                     cfg.taker_avoidance_buffer, halted=halted)
+
+                if not halted:
+                    maybe_protect_profit(state, protect_trader, protect_filters)
 
                 write_ladder_ledgers(state, cfg)
 
