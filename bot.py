@@ -10,7 +10,8 @@ from config import load_config
 from health import write_heartbeat
 from ladder_ledger import write_ladder_ledgers
 from ledger import log_buy_fill, log_sell_fill
-from pct_ladder import (distribute_profit_ladder_aware, is_legacy_offset, ladder_specs,
+from pct_ladder import (is_self_compound_rung, self_compound_profit,
+                        distribute_profit_ladder_aware, is_legacy_offset, ladder_specs,
                          liquidate_coin_reserve_position, liquidate_legacy_position,
                          maybe_fund_sell_from_reserve, maybe_protect_profit, maybe_reshape_ladders)
 from state import load_state, save_state
@@ -238,7 +239,7 @@ def run():
                             # same meaning as before), distributed_usdt is everything else
                             # (accumulation + compounding + coin reserve combined). Full
                             # per-bucket amounts are in the pct_ladder log line and state.json.
-                            reserved_amount = profit * cfg.ladder_reserve_ratio
+                            reserved_amount = 0.0 if is_self_compound_rung(lvl, cfg) else profit * cfg.ladder_reserve_ratio
                             log_sell_fill(cfg.ledger_file, lvl.index, lvl.buy_price, lvl.sell_price,
                                           lvl.qty, profit, reserved_amount, profit - reserved_amount,
                                           lvl.one_shot, cfg.dry_run)
@@ -276,7 +277,9 @@ def run():
                                 lvl.buy_order_id = None
                                 lvl.sell_order_id = None
                                 lvl.qty = 0.0
-                                if cfg.pct_ladder_enabled and not lvl.one_shot:
+                                if is_self_compound_rung(lvl, cfg):
+                                    self_compound_profit(state, lvl, profit)
+                                elif cfg.pct_ladder_enabled and not lvl.one_shot:
                                     distribute_profit_ladder_aware(state, profit, sold_offset_pct, cfg, trader, filters)
                                 else:
                                     # No ladder to attribute this to (pct_ladder
